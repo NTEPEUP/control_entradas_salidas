@@ -29,11 +29,20 @@ Route::post('/validate-pin', [PinValidationController::class, 'validatePin'])
 
 Route::get('/access-logs', function () {
     $recent = AccessLog::latest()->take(10)->get();
+    $total = AccessLog::count();
+    $granted = AccessLog::where('status', 'granted')->count();
+    $denied = AccessLog::where('status', 'denied')->count();
 
     return response()->json([
         'recent' => $recent,
-        'total' => AccessLog::count(),
-        'granted' => AccessLog::where('status', 'granted')->count(),
-        'denied' => AccessLog::where('status', 'denied')->count(),
+        'total' => $total,
+        'granted' => $granted,
+        'denied' => $denied,
+        'stats' => [
+            'total' => $total,
+            'granted' => $granted,
+            'denied' => $denied,
+            'rate' => $total > 0 ? round(($granted / $total) * 100, 1) : 0,
+        ],
     ]);
 });

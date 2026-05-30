@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>IoT Access Dashboard</title>
+    <title>Control de accesos</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
@@ -17,7 +17,15 @@
             <a href="{{ route('access-pins.index') }}" class="px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 text-sm font-semibold">Gestionar PINs</a>
         </div>
 
-        <!-- Stats Cards -->
+        <div class="fixed top-4 right-4 z-50 space-y-3 w-full max-w-sm pointer-events-none">
+            <template x-for="toast in notifications" :key="toast.id">
+                <div class="pointer-events-auto rounded-lg border px-4 py-3 shadow-lg bg-gray-800 text-sm" :class="toast.classes">
+                    <p class="font-semibold" x-text="toast.title"></p>
+                    <p class="text-gray-200/90 mt-1" x-text="toast.message"></p>
+                </div>
+            </template>
+        </div>
+
         <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
             <template x-for="stat in stats" :key="stat.label">
                 <div class="bg-gray-800 p-4 rounded-lg shadow">
@@ -28,15 +36,13 @@
         </div>
 
         <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            <!-- Chart -->
             <div class="lg:col-span-2 bg-gray-800 p-6 rounded-lg shadow">
                 <h3 class="text-lg font-semibold mb-4">Actividad por Estado</h3>
                 <canvas id="statusChart" height="120"></canvas>
             </div>
 
-            <!-- Live Log Table -->
             <div class="bg-gray-800 p-6 rounded-lg shadow">
-                <h3 class="text-lg font-semibold mb-4">📡 Últimos Accesos <span class="text-xs bg-green-600 px-2 py-0.5 rounded">LIVE</span></h3>
+                <h3 class="text-lg font-semibold mb-4"> Últimos Accesos <span class="text-xs bg-green-600 px-2 py-0.5 rounded">LIVE</span></h3>
                 <div class="overflow-y-auto max-h-80">
                     <table class="w-full text-sm text-left">
                         <thead class="text-gray-400 border-b border-gray-700">
@@ -50,7 +56,7 @@
                                     <td class="py-2 font-mono" x-text="log.owner_name || 'N/A'"></td>
                                     <td class="py-2">
                                         <span class="px-2 py-1 rounded text-xs font-bold"
-                                              :class="log.status === 'granted' ? 'bg-green-900 text-green-300' : 
+                                              :class="log.status === 'granted' ? 'bg-green-900 text-green-300' :
                                                       log.status === 'denied' ? 'bg-red-900 text-red-300' : 'bg-yellow-900 text-yellow-300'"
                                               x-text="log.status.toUpperCase()"></span>
                                     </td>
@@ -63,65 +69,123 @@
         </div>
     </div>
 
+    <script type="application/json" id="dashboard-data">
+        {!! json_encode([
+            'stats' => [
+                'total' => $stats['total'] ?? 0,
+                'granted' => $stats['granted'] ?? 0,
+                'denied' => $stats['denied'] ?? 0,
+                'rate' => $stats['rate'] ?? 0,
+            ],
+            'recent' => $recent,
+            'broadcast' => [
+                'driver' => config('broadcasting.default'),
+                'pusherKey' => config('broadcasting.connections.pusher.key'),
+                'pusherCluster' => config('broadcasting.connections.pusher.options.cluster'),
+                'pusherHost' => env('PUSHER_HOST'),
+                'pusherPort' => env('PUSHER_PORT'),
+                'pusherScheme' => env('PUSHER_SCHEME', 'https'),
+            ],
+        ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) !!}
+    </script>
+
     <script>
+        const dashboardData = JSON.parse(document.getElementById('dashboard-data').textContent);
+
         function dashboard() {
             return {
                 stats: [
-                    { label: 'Total', value: @json($stats['total'] ?? 0) },
-                    { label: 'Concedidos', value: @json($stats['granted'] ?? 0) },
-                    { label: 'Denegados', value: @json($stats['denied'] ?? 0) },
-                    { label: 'Tasa (%)', value: @json($stats['rate'] ?? 0) }
+                    { label: 'Total', value: dashboardData.stats.total },
+                    { label: 'Concedidos', value: dashboardData.stats.granted },
+                    { label: 'Denegados', value: dashboardData.stats.denied },
+                    { label: 'Tasa (%)', value: dashboardData.stats.rate }
                 ],
-                logs: @json($recent),
+                logs: dashboardData.recent,
+                notifications: [],
                 chart: null,
+                echo: null,
                 init() {
-                    // Para desarrollo local con driver 'log', haremos polling cada 5 segundos
-                    @if (config('broadcasting.default') === 'log')
+                    this.refreshLogs();
+
+                    if (dashboardData.broadcast.driver === 'log') {
                         setInterval(() => this.refreshLogs(), 5000);
-                    @else
-                        // Configurar Laravel Echo para Pusher/Redis
-                        if (window.Echo) {
-                            window.Echo.channel('dashboard')
-                                .listen('.access.new', (e) => {
-                                    const newLog = e.log;
-                                    this.logs.unshift(newLog);
-                                    if (this.logs.length > 50) this.logs.pop();
+                    } else {
+                        this.initEcho();
+                        setInterval(() => this.refreshLogs(), 30000);
+                    }
 
-                                    // Si el evento trae stats, sincronizamos exactamente
-                                    if (e.stats) {
-                                        this.stats[0].value = e.stats.total;
-                                        this.stats[1].value = e.stats.granted;
-                                        this.stats[2].value = e.stats.denied;
-                                        this.stats[3].value = e.stats.rate;
-                                    } else {
-                                        // Fallback: incrementar localmente
-                                        if (newLog.status === 'granted') this.stats[1].value++;
-                                        if (newLog.status === 'denied') this.stats[2].value++;
-                                        this.stats[0].value++;
-                                        this.stats[3].value = Math.round((this.stats[1].value / this.stats[0].value) * 1000) / 10;
-                                    }
+                    this.renderChart();
 
-                                    // Actualizar gráfico
-                                    this.updateChart();
-                                });
-                        }
-                    @endif
-
-                    this.initChart();
+                    if ('Notification' in window && Notification.permission === 'default') {
+                        Notification.requestPermission().catch(() => {});
+                    }
                 },
-                initChart() {
+                initEcho() {
+                    const pusherKey = dashboardData.broadcast.pusherKey;
+                    const pusherCluster = dashboardData.broadcast.pusherCluster;
+                    const pusherHost = dashboardData.broadcast.pusherHost;
+                    const pusherPort = dashboardData.broadcast.pusherPort;
+                    const pusherScheme = dashboardData.broadcast.pusherScheme;
+
+                    if (!pusherKey && !pusherHost) {
+                        console.warn('Echo no se inicializó: faltan credenciales o host de websocket.');
+                        return;
+                    }
+
+                    const options = {
+                        broadcaster: 'pusher',
+                        key: pusherKey,
+                        cluster: pusherCluster || 'mt1',
+                        forceTLS: pusherScheme !== 'http'
+                    };
+
+                    if (pusherHost) {
+                        options.wsHost = pusherHost;
+                        if (pusherPort) {
+                            options.wsPort = Number(pusherPort);
+                            options.wssPort = Number(pusherPort);
+                        }
+                        options.enabledTransports = ['ws', 'wss'];
+                    }
+
+                    this.echo = new Echo(options);
+                    this.echo.channel('dashboard')
+                        .listen('.access.new', (e) => this.handleRealtimeUpdate(e));
+                },
+                handleRealtimeUpdate(e) {
+                    this.syncDashboard(e);
+                    this.pushToastFromEvent(e);
+                },
+                syncDashboard(payload) {
+                    const newLog = payload.log || payload;
+
+                    if (payload.recent) {
+                        this.logs = payload.recent;
+                    } else if (newLog && newLog.id) {
+                        this.logs = [newLog, ...this.logs.filter((log) => log.id !== newLog.id)].slice(0, 10);
+                    }
+
+                    const stats = payload.stats || payload;
+                    if (stats.total !== undefined) this.stats[0].value = stats.total;
+                    if (stats.granted !== undefined) this.stats[1].value = stats.granted;
+                    if (stats.denied !== undefined) this.stats[2].value = stats.denied;
+                    if (stats.rate !== undefined) this.stats[3].value = stats.rate;
+
+                    this.updateChart();
+                },
+                renderChart() {
                     const ctx = document.getElementById('statusChart').getContext('2d');
+                    if (this.chart) {
+                        this.chart.destroy();
+                    }
+
                     this.chart = new Chart(ctx, {
                         type: 'bar',
                         data: {
                             labels: ['Concedido', 'Denegado', 'Error/Timeout'],
                             datasets: [{
                                 label: 'Accesos',
-                                data: [
-                                    this.logs.filter(l => l.status === 'granted').length,
-                                    this.logs.filter(l => l.status === 'denied').length,
-                                    this.logs.filter(l => !['granted', 'denied'].includes(l.status)).length
-                                ],
+                                data: this.getChartData(),
                                 backgroundColor: ['#10b981', '#ef4444', '#f59e0b']
                             }]
                         },
@@ -129,37 +193,83 @@
                     });
                 },
                 updateChart() {
-                    if (!this.chart) return;
-                    this.chart.data.datasets[0].data = [
-                        this.logs.filter(l => l.status === 'granted').length,
-                        this.logs.filter(l => l.status === 'denied').length,
-                        this.logs.filter(l => !['granted', 'denied'].includes(l.status)).length
-                    ];
-                    this.chart.update();
+                    this.renderChart();
+                },
+                getChartData() {
+                    const total = Number(this.stats[0].value) || 0;
+                    const granted = Number(this.stats[1].value) || 0;
+                    const denied = Number(this.stats[2].value) || 0;
+                    const remaining = Math.max(total - granted - denied, 0);
+
+                    return [granted, denied, remaining];
                 },
                 formatTime(date) {
                     return new Date(date).toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
                 },
+                pushToastFromEvent(payload) {
+                    const log = payload.log || payload;
+                    const status = (payload.status || log.status || 'info').toLowerCase();
+                    const title = this.getToastTitle(status);
+                    const message = payload.message || this.getToastMessage(log, title);
+                    const toastId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+                    this.notifications.unshift({
+                        id: toastId,
+                        title,
+                        message,
+                        classes: this.getToastClasses(status)
+                    });
+
+                    if (this.notifications.length > 3) {
+                        this.notifications.pop();
+                    }
+
+                    setTimeout(() => {
+                        this.notifications = this.notifications.filter((toast) => toast.id !== toastId);
+                    }, 5000);
+
+                    this.pushBrowserNotification(message, status);
+                },
+                getToastTitle(status) {
+                    if (status === 'granted') return 'Acceso concedido';
+                    if (status === 'denied') return 'Acceso denegado';
+                    if (status === 'error') return 'Error de acceso';
+                    if (status === 'timeout') return 'Tiempo agotado';
+                    return 'Nueva actividad';
+                },
+                getToastMessage(log, title) {
+                    if (!log) {
+                        return 'Se registró una nueva actividad.';
+                    }
+
+                    const pin = log.pin ? `PIN ${log.pin}` : 'PIN desconocido';
+                    const owner = log.owner_name ? ` - ${log.owner_name}` : '';
+
+                    return `${title} (${pin})${owner}`;
+                },
+                getToastClasses(status) {
+                    if (status === 'granted') return 'border-green-700 bg-green-950/95';
+                    if (status === 'denied') return 'border-red-700 bg-red-950/95';
+                    if (status === 'error' || status === 'timeout') return 'border-amber-700 bg-amber-950/95';
+                    return 'border-gray-700 bg-gray-800';
+                },
+                pushBrowserNotification(message, status) {
+                    if (!('Notification' in window) || Notification.permission !== 'granted') {
+                        return;
+                    }
+
+                    new Notification('Control de accesos', {
+                        body: message,
+                        tag: status,
+                    });
+                },
                 async refreshLogs() {
-                    // Obtener logs actualizados mediante fetch (polling para desarrollo local)
                     try {
                         const response = await fetch('/api/access-logs');
                         if (!response.ok) return;
                         const data = await response.json();
-                        this.logs = data.recent || [];
-                        if (data.total !== undefined) {
-                            this.stats[0].value = data.total;
-                        }
-                        if (data.granted !== undefined) {
-                            this.stats[1].value = data.granted;
-                        }
-                        if (data.denied !== undefined) {
-                            this.stats[2].value = data.denied;
-                        }
-                        if (data.total !== undefined && data.granted !== undefined) {
-                            this.stats[3].value = data.total > 0 ? Math.round((data.granted / data.total) * 1000) / 10 : 0;
-                        }
-                        this.updateChart();
+
+                        this.syncDashboard(data);
                     } catch (e) {
                         console.log('Error refreshing logs:', e);
                     }
